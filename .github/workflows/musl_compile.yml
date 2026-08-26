@@ -1,0 +1,89 @@
+name: Musl Linux Build
+
+on:
+  push:
+    branches: [main, master, musl_compile]
+  pull_request:
+    branches: [main, master]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-musl:
+    name: Build (x86_64-unknown-linux-musl)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Build OpenSSL for musl (properly)
+        run: |
+          # Download OpenSSL
+          wget https://www.openssl.org/source/openssl-3.0.13.tar.gz
+          tar xzf openssl-3.0.13.tar.gz
+          cd openssl-3.0.13
+          
+          # OPENSSL compile
+          # Added 'no-afalgeng' to prevent linux/version.h kernel header requirement
+          CC="musl-gcc" CFLAGS="-O2" \
+          ./Configure no-asm no-shared no-secure-memory no-afalgeng linux-x86_64 -static \
+            --prefix=/usr/local/musl \
+            --openssldir=/usr/local/musl/ssl
+          
+          # Build
+          make -j$(nproc)
+          sudo make install_sw
+          cd ..
+          
+          # Set environment variables for cargo
+          echo "OPENSSL_DIR=/usr/local/musl" >> $GITHUB_ENV
+          echo "OPENSSL_STATIC=1" >> $GITHUB_ENV
+          echo "PKG_CONFIG_ALLOW_CROSS=1" >> $GITHUB_ENV
+          echo "OPENSSL_NO_VENDOR=1" >> $GITHUB_ENV
+          
+          # Tell the linker to use our custom build
+          echo "LD_LIBRARY_PATH=/usr/local/musl/lib" >> $GITHUB_ENV
+          echo "LIBRARY_PATH=/usr/local/musl/lib" >> $GITHUB_ENV
+          echo "C_INCLUDE_PATH=/usr/local/musl/include" >> $GITHUB_ENV
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: musl-build
+
+      - name: Build for musl
+        run: cargo build --target x86_64-unknown-linux-musl --release
+        env:
+          OPENSSL_DIR: /usr/local/musl
+          OPENSSL_STATIC: 1
+          PKG_CONFIG_ALLOW_CROSS: 1
+          # Force rustc to use our custom linker flags
+          RUSTFLAGS: "-C target-feature=+crt-static -C link-arg=-static"
+
+      - name: Verify binary
+        run: |
+          file target/x86_64-unknown-linux-musl/release/jcode
+          ldd target/x86_64-unknown-linux-musl/release/jcode || echo "Static binary (no dynamic deps)"
+          readelf -d target/x86_64-unknown-linux-musl/release/jcode | grep NEEDED || echo "No dynamic dependencies!"
+
+      - name: Package binary
+        run: |
+          mkdir -p dist
+          cp target/x86_64-unknown-linux-musl/release/jcode dist/jcode-musl-x86_64
+          chmod +x dist/jcode-musl-x86_64
+          cd dist && tar czf jcode-musl-x86_64.tar.gz jcode-musl-x86_64
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: jcode-musl-x86_64
+          path: dist/jcode-musl-x86_64.tar.gz
+          retention-days: 30
